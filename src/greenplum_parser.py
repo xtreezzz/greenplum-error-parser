@@ -62,7 +62,7 @@ def extract_logging_statements(code):
         if not match:
             break
         start_index = match.start()
-        line_number = get_line_number(start_index)
+        base_line_number = get_line_number(start_index)
         paren_count = 1  # Already found the first '('
         i = match.end()
         while i < length and paren_count > 0:
@@ -74,11 +74,20 @@ def extract_logging_statements(code):
             elif char == '"' and (i == 0 or code[i - 1] != '\\'):
                 # Skip strings to avoid miscounting parentheses
                 i += 1
-                while i < length and (code[i] != '"' or code[i - 1] == '\\'):
+                while i < length and (i < length) and (code[i] != '"' or code[i - 1] == '\\'):
                     i += 1
             i += 1
         end_index = i
         statement = code[start_index:end_index]
+
+        # Checking for parser_errposition
+        parser_pos = statement.find('parser_errposition')
+        if parser_pos != -1:
+            global_parser_pos = start_index + parser_pos
+            line_number = get_line_number(global_parser_pos)
+        else:
+            line_number = base_line_number
+
         statements.append((statement, line_number))
         index = end_index
     return statements
