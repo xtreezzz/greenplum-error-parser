@@ -20,88 +20,12 @@ errcode_mapping = load_errcode_mapping()
 
 def remove_comments(code):
     """
-    Removes comments from the code. (Not used for line numbering.)
+    Removes single-line and multi-line comments from the code. (Not used for line numbering.)
     """
-    # Remove single-line comments
     code = re.sub(r'//.*', '', code)
     code = re.sub(r'#.*', '', code)
-    # Remove multi-line comments
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     return code
-
-def extract_logging_statements(code):
-    """
-    Extracts logging statements (elog/ereport) from the code along with their line numbers.
-    Preserves correct line numbering by using the original code (including comments).
-    """
-    log_functions = ['elog', 'ereport']
-    pattern = re.compile(r'\b(' + '|'.join(log_functions) + r')\b\s*\(')
-
-    statements = []
-    index = 0
-    length = len(code)
-
-    # Build a list of line start positions
-    line_starts = [0]
-    for m in re.finditer('\n', code):
-        line_starts.append(m.end())
-
-    def get_line_number(pos):
-        left, right = 0, len(line_starts) - 1
-        while left <= right:
-            mid = (left + right) // 2
-            if line_starts[mid] <= pos:
-                left = mid + 1
-            else:
-                right = mid - 1
-        return right + 1  # Lines start at 1
-
-    while index < length:
-        match = pattern.search(code, index)
-        if not match:
-            break
-
-        # The line of the 'ereport' or 'elog' call
-        start_index = match.start()
-        base_line_number = get_line_number(start_index)
-
-        # Find the end of this logging statement by matching parentheses
-        paren_count = 1
-        i = match.end()
-        while i < length and paren_count > 0:
-            char = code[i]
-            if char == '(':
-                paren_count += 1
-            elif char == ')':
-                paren_count -= 1
-            elif char == '"' and (i == 0 or code[i - 1] != '\\'):
-                # Skip string contents so we don't miscount parentheses inside strings
-                i += 1
-                while i < length and (code[i] != '"' or code[i - 1] == '\\'):
-                    i += 1
-            i += 1
-        end_index = i
-        statement = code[start_index:end_index]
-
-        # 1) If parser_errposition is present, use its line
-        parser_pos = statement.find('parser_errposition')
-        if parser_pos != -1:
-            global_parser_pos = start_index + parser_pos
-            line_number = get_line_number(global_parser_pos)
-        else:
-            # 2) If parser_errposition is not found, look for errmsg
-            errmsg_pos = statement.find('errmsg')
-            if errmsg_pos != -1:
-                global_errmsg_pos = start_index + errmsg_pos
-                line_number = get_line_number(global_errmsg_pos)
-            else:
-                # 3) Otherwise, use the base line
-                line_number = base_line_number
-
-        statements.append((statement, line_number))
-        index = end_index
-
-    return statements
 
 def preprocess_log(log):
     """
@@ -114,7 +38,7 @@ def preprocess_log(log):
 
 def split_arguments(s):
     """
-    Splits the argument string into a list, considering parentheses, quotes, and escaped characters.
+    Splits the given string into a list of arguments, taking into account parentheses, quotes, and escape characters.
     """
     args = []
     current_arg = ''
@@ -163,10 +87,125 @@ def split_arguments(s):
         args.append(current_arg.strip())
     return args
 
+def find_function_call_end_offset(s, start_pos):
+    """
+    Starting from start_pos (where the function name begins), finds the opening '(' after the name,
+    then balances the parentheses and returns the offset of the closing ')' relative to the beginning of s.
+    """
+    open_paren_match = re.search(r'\(\s*', s[start_pos:])
+    if not open_paren_match:
+        return start_pos  # No '(' found
+    paren_open_local = open_paren_match.start()
+    pos = start_pos + paren_open_local + 1  # Move past '('
+    length = len(s)
+    paren_count = 1
+
+    while pos < length and paren_count > 0:
+        c = s[pos]
+        if c == '(':
+            paren_count += 1
+        elif c == ')':
+            paren_count -= 1
+        elif c == '"':
+            # Skip everything until the next unescaped quote
+            pos += 1
+            while pos < length:
+                if s[pos] == '"' and s[pos - 1] != '\\':
+                    break
+                pos += 1
+        pos += 1
+    return pos - 1  # Position of the closing ')'
+
+def get_last_function_call_offset(statement):
+    """
+    Searches for all function calls in the form \w+\s*\(...\) inside 'statement' and returns the
+    farthest closing parenthesis offset. If no functions are found, returns the end of 'statement'.
+    """
+    pattern = re.compile(r'\b[A-Za-z_]\w*\s*\(')
+    i = 0
+    length = len(statement)
+    last_offset = 0
+
+    while True:
+        match = pattern.search(statement, i)
+        if not match:
+            break
+        func_start = match.start()  # Where the function name starts
+        i = match.end()             # Move 'i' so we can search further
+        call_end = find_function_call_end_offset(statement, func_start)
+        if call_end > last_offset:
+            last_offset = call_end
+
+    if last_offset == 0:
+        last_offset = length - 1
+    return last_offset
+
+def extract_logging_statements(code):
+    """
+    Extracts all calls to elog/ereport from the source code along with line numbers,
+    preserving the correct line numbering by using the original code (including comments).
+    """
+    log_functions = ['elog', 'ereport']
+    pattern = re.compile(r'\b(' + '|'.join(log_functions) + r')\b\s*\(')
+
+    statements = []
+    index = 0
+    length = len(code)
+
+    # Build a list of line start positions
+    line_starts = [0]
+    for m in re.finditer('\n', code):
+        line_starts.append(m.end())
+
+    def get_line_number(pos):
+        left, right = 0, len(line_starts) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            if line_starts[mid] <= pos:
+                left = mid + 1
+            else:
+                right = mid - 1
+        return right + 1  # Lines are counted starting at 1
+
+    while index < length:
+        match = pattern.search(code, index)
+        if not match:
+            break
+
+        start_index = match.start()
+
+        # Parse parentheses to find the end of the entire expression: ereport(...) or elog(...)
+        paren_count = 1
+        i = match.end()
+        while i < length and paren_count > 0:
+            char = code[i]
+            if char == '(':
+                paren_count += 1
+            elif char == ')':
+                paren_count -= 1
+            elif char == '"' and (i == 0 or code[i - 1] != '\\'):
+                i += 1
+                while i < length and (code[i] != '"' or code[i - 1] == '\\'):
+                    i += 1
+            i += 1
+        end_index = i
+        statement = code[start_index:end_index]
+
+        # Find the most distant function call so we can get its ending ')'
+        offset_in_statement = get_last_function_call_offset(statement)
+        global_offset = start_index + offset_in_statement
+
+        line_number = get_line_number(global_offset)
+        statements.append((statement, line_number))
+
+        index = end_index
+
+    return statements
+
 def find_function_calls(s, func_names):
     """
-    Finds all function calls in the string s with names from func_names.
-    Returns a list of dicts with 'func_name' and 'args_str'.
+    Searches the string s for function calls matching names from func_names,
+    returns a list of dicts with 'func_name' and 'args_str'.
     """
     results = []
     pattern = re.compile(r'(' + '|'.join(func_names) + r')\s*\(')
@@ -190,8 +229,7 @@ def find_function_calls(s, func_names):
                 while pos < length and (s[pos] != '"' or s[pos - 1] == '\\'):
                     pos += 1
             pos += 1
-        # Exclude the final parenthesis
-        args_str = s[start:pos - 1]
+        args_str = s[start:pos - 1]  # Excluding the final parenthesis
         results.append({'func_name': func_name, 'args_str': args_str})
         i = pos
     return results
@@ -234,7 +272,6 @@ def extract_ereport(log):
             if sub_args:
                 errmsg_template_raw = sub_args[0].strip()
 
-                # Remove outer quotes if present
                 if errmsg_template_raw.startswith('"') and errmsg_template_raw.endswith('"'):
                     errmsg_template_raw = errmsg_template_raw[1:-1]
                     try:
@@ -244,7 +281,6 @@ def extract_ereport(log):
                 else:
                     errmsg_template = errmsg_template_raw
 
-                # Subsequent arguments are variables
                 if len(sub_args) > 1:
                     errmsg_variables = sub_args[1:]
         elif func['func_name'] in errcode_functions:
@@ -263,7 +299,7 @@ def extract_ereport(log):
 
 def extract_elog(log):
     """
-    Extracts information from elog(...) calls using a regex.
+    Extracts information from elog(...) calls using a regex for simpler cases.
     """
     pattern = re.compile(r'elog\s*\(\s*(.*?)\s*,\s*(.*)\s*\)$', re.DOTALL)
     match = pattern.search(log)
@@ -298,29 +334,24 @@ def extract_elog(log):
 
 def clean_errmsg_template(errmsg_template):
     """
-    Cleans the errmsg_template by removing format specifiers, escaped chars, and quotes.
+    Cleans the errmsg_template by removing C-style format specifiers, escaped characters,
+    and quotes, then collapsing multiple spaces.
     """
     if errmsg_template is None:
         return None
 
-    # Remove C-style format specifiers like %s, %d, etc.
     pattern = r'%(?:\d+\$)?[+-]?(?:0| )?(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|h|ll|l|j|z|t|L)?[diuoxXfFeEgGaAcCsSpn%]'
     cleaned = re.sub(pattern, '', errmsg_template)
 
-    # Remove escaped characters \n, \t, \r
     cleaned = re.sub(r'\\[nrt]', '', cleaned)
-
-    # Remove quotes
     cleaned = cleaned.replace('"', '').replace("'", '')
-
-    # Collapse multiple spaces
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
 
     return cleaned
 
 def extract_info_from_log(log):
     """
-    Determines if it's an ereport or elog statement and extracts info accordingly.
+    Determines whether it's an ereport or elog statement and extracts relevant information accordingly.
     """
     log = preprocess_log(log)
 
@@ -380,7 +411,6 @@ def extract_info_from_log(log):
                 'script_parse_error': 'Failed to parse elog log'
             }
     else:
-        # Not ereport or elog
         return {
             'log': log,
             'severity_level': None,
@@ -406,21 +436,16 @@ def main():
     directory = args.source_directory
     output_file = args.output_file
 
-    # Dictionary for storing results: { filepath -> list of (statement, line_number) }
     file_logging_statements = defaultdict(list)
 
     # Recursively traverse the source directory
     for root, dirs, files in os.walk(directory):
         for filename in files:
-            # Process C/C++, headers, Python, Perl, Go, SQL files
             if filename.endswith(('.c', '.cpp', '.h', '.hpp', '.py', '.pl', '.go', '.sql')):
                 filepath = os.path.join(root, filename)
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        # Read the original code without removing comments
                         code = f.read()
-
-                        # Extract logging statements with original line numbering
                         statements_with_lines = extract_logging_statements(code)
                         if statements_with_lines:
                             file_logging_statements[filepath].extend(statements_with_lines)
@@ -429,17 +454,14 @@ def main():
 
     parsed_logs = []
 
-    # Parse each extracted statement
     for filepath, statements in file_logging_statements.items():
         for stmt, line_number in statements:
             info = extract_info_from_log(stmt)
-            # Convert to relative path and append line number
             relative_path = os.path.relpath(filepath, directory)
             relative_path = relative_path.replace('\\', '/')
             info['file_path'] = f"{relative_path}:{line_number}"
             parsed_logs.append(info)
 
-    # Build the list of errors
     errors = []
     for log_info in parsed_logs:
         if log_info['script_parse_error'] is None and log_info['errmsg_template'] is not None:
@@ -459,12 +481,10 @@ def main():
             }
             errors.append(error_entry)
 
-    # Write all errors to a single JSON file
     output_data = {"errors": errors}
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, ensure_ascii=False, indent=4)
 
-    # Print summary
     total_logs = len(parsed_logs)
     total_errors = len(errors)
     print(f"Total logging statements: {total_logs}")
