@@ -441,7 +441,7 @@ def main():
     # Recursively traverse the source directory
     for root, dirs, files in os.walk(directory):
         for filename in files:
-            if filename.endswith(('.c', '.cpp', '.h', '.hpp', '.py', '.pl', '.go', '.sql')):
+            if filename.endswith(('.c', '.cpp', '.h', '.hpp', '.py', '.pl', '.go', '.sql','.l','.y')):
                 filepath = os.path.join(root, filename)
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
